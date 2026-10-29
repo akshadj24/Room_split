@@ -102,7 +102,14 @@ app.include_router(ai_router, prefix="/api/v1", tags=["ai"])
 app.include_router(household_reminders_router, prefix="/api/v1", tags=["reminders"])
 app.include_router(reminders_router, prefix="/api/v1", tags=["reminders"])
 
+@app.get("/")
+@app.head("/")
+def root():
+    return {"status": "ok", "message": "RoomSplit API is running"}
+
+
 @app.get("/health")
+@app.head("/health")
 def health():
     return {"status": "ok"}
 
