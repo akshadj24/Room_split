@@ -317,18 +317,14 @@ def test_rate_limit_enforced(client, db):
 
 def test_provider_timeout_handled_gracefully(db):
     """Test acceptance criterion: Provider timeout handled gracefully."""
-    import anthropic
+    import httpx
 
     service = AIService(api_key="test-api-key")
     owner = _create_user(db, "Timeout User", "timeout@test.com")
     h = _create_household(db, "Timeout Apt", owner)
 
-    with patch("anthropic.Anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.return_value = mock_client
-        mock_client.messages.create.side_effect = anthropic.APITimeoutError(
-            request=MagicMock()
-        )
+    with patch("httpx.Client.post") as mock_post:
+        mock_post.side_effect = httpx.TimeoutException("Connection timed out")
 
         with pytest.raises(HTTPException) as exc_info:
             service.process_chat(
@@ -347,7 +343,9 @@ def test_provider_timeout_handled_gracefully(db):
 # ==============================================================================
 
 def test_api_chat_flow_with_tool_call(client, db):
-    """Test full /api/v1/households/{id}/ai/chat flow with mocked Claude tool calling."""
+    """Test full /api/v1/households/{id}/ai/chat flow with mocked Mistral tool calling."""
+    import json
+
     # Register and login user via API
     client.post("/api/v1/auth/register", json={"name": "Alice", "email": "alice_api@test.com", "password": "password123"})
     login_res = client.post("/api/v1/auth/login", json={"email": "alice_api@test.com", "password": "password123"})
@@ -361,35 +359,61 @@ def test_api_chat_flow_with_tool_call(client, db):
     # Reset rate limit for clean test
     ai_rate_limiter.reset()
 
-    # Mock Claude message responses:
-    # First response: tool_use "propose_expense"
+    # Mock Mistral chat completion responses:
+    # First response: tool_calls with propose_expense
     # Second response: text explanation of draft
-    mock_tool_block = MagicMock()
-    mock_tool_block.type = "tool_use"
-    mock_tool_block.id = "call_abc123"
-    mock_tool_block.name = "propose_expense"
-    mock_tool_block.input = {
-        "amount": 600.0,
-        "description": "Internet Router",
-        "category": "Utilities",
-        "paid_by": "me",
-        "split_type": "equal",
+    mock_first_resp = MagicMock()
+    mock_first_resp.status_code = 200
+    mock_first_resp.json.return_value = {
+        "id": "cmpl_123",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_abc123",
+                            "type": "function",
+                            "function": {
+                                "name": "propose_expense",
+                                "arguments": json.dumps({
+                                    "amount": 600.0,
+                                    "description": "Internet Router",
+                                    "category": "Utilities",
+                                    "paid_by": "me",
+                                    "split_type": "equal",
+                                }),
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
     }
 
-    first_claude_resp = MagicMock()
-    first_claude_resp.content = [mock_tool_block]
-
-    second_claude_resp = MagicMock()
-    mock_text_block = MagicMock()
-    mock_text_block.type = "text"
-    mock_text_block.text = "Here's the expense draft:\nAmount: ₹600 | Category: Utilities\nPaid by: You | Split: Equal\n[Confirm] [Cancel]"
-    second_claude_resp.content = [mock_text_block]
+    mock_second_resp = MagicMock()
+    mock_second_resp.status_code = 200
+    mock_second_resp.json.return_value = {
+        "id": "cmpl_124",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Here's the expense draft:\nAmount: ₹600 | Category: Utilities\nPaid by: You | Split: Equal\n[Confirm] [Cancel]",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
 
     with patch("app.core.config.settings.LLM_API_KEY", "dummy-key"), \
-         patch("anthropic.Anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.return_value = mock_client
-        mock_client.messages.create.side_effect = [first_claude_resp, second_claude_resp]
+         patch("httpx.Client.post", side_effect=[mock_first_resp, mock_second_resp]):
 
         chat_res = client.post(
             f"/api/v1/households/{h_id}/ai/chat",

@@ -19,7 +19,6 @@ dependencies = [
     "ruff",
     "pyjwt>=2.15.1",
     "pillow>=13.0.0",
-    "anthropic>=2.3.0",
     "apscheduler>=3.11.3",
 ]
 

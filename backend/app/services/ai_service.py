@@ -4,6 +4,7 @@ import logging
 from datetime import date, datetime
 from typing import Any
 
+import httpx
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -769,17 +770,39 @@ def execute_authorized_tool(
     return result, draft
 
 
+def _format_tools_for_mistral(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    formatted = []
+    for t in tools:
+        if t.get("type") == "function":
+            formatted.append(t)
+        else:
+            formatted.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t.get("input_schema") or t.get("parameters", {}),
+                },
+            })
+    return formatted
+
+
 # --- LLM Adapter & Orchestration ---
 
 class AIService:
     """
-    LLM Adapter wrapping Anthropic Claude.
-    Swap-friendly — rest of application never imports Anthropic SDK directly.
+    LLM Adapter wrapping Mistral API.
+    Swap-friendly — communicates directly via standard HTTP (httpx).
     """
 
     def __init__(self, api_key: str | None = None, model: str | None = None):
         self.api_key = api_key if api_key is not None else settings.LLM_API_KEY
-        self.model = model if model else (settings.LLM_MODEL or "claude-sonnet-4-6")
+        self.model = model if model else (
+            settings.LLM_MODEL
+            if settings.LLM_MODEL and "mistral" in settings.LLM_MODEL.lower()
+            else "mistral-small-latest"
+        )
+        self.base_url = "https://api.mistral.ai/v1/chat/completions"
 
     def _build_system_prompt(self, db: Session, household_id: int, actor_id: int) -> str:
         household = db.query(Household).filter(Household.id == household_id).first()
@@ -816,7 +839,7 @@ class AIService:
         request: ChatRequest,
     ) -> ChatResponse:
         """
-        Orchestrates Anthropic Claude request with function calling / tools loop.
+        Orchestrates Mistral API request with function calling / tools loop.
         """
         _validate_household_membership(db, household_id, actor_id)
 
@@ -826,118 +849,144 @@ class AIService:
                 detail="AI service is not configured (missing LLM API key).",
             )
 
-        try:
-            import anthropic
-        except ImportError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Anthropic SDK is not installed.",
-            )
-
         system_prompt = self._build_system_prompt(db, household_id, actor_id)
 
-        # Build message history for Claude
-        messages: list[dict[str, Any]] = []
+        # Build message history for Mistral
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         for msg in request.conversation_history[-8:]:  # limit context window
             if msg.role in ("user", "assistant"):
                 messages.append({"role": msg.role, "content": msg.content})
 
         messages.append({"role": "user", "content": request.message})
 
-        client = anthropic.Anthropic(
-            api_key=self.api_key,
-            timeout=25.0,
-            max_retries=2,
-        )
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        tools_payload = _format_tools_for_mistral(APPROVED_TOOLS)
 
         executed_tools: list[str] = []
         final_draft: ExpenseDraft | None = None
 
         try:
-            # Step 1: Initial call to Claude
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=messages,
-                tools=APPROVED_TOOLS,
-            )
+            with httpx.Client(timeout=25.0) as client:
+                # Step 1: Initial call to Mistral
+                first_payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": tools_payload,
+                    "tool_choice": "auto",
+                }
 
-            # Check if Claude requested tool calls
-            tool_calls = [c for c in response.content if c.type == "tool_use"]
+                resp = client.post(self.base_url, headers=headers, json=first_payload)
+                resp.raise_for_status()
+                resp_data = resp.json()
 
-            if not tool_calls:
-                reply_text = "".join(c.text for c in response.content if c.type == "text")
+                choices = resp_data.get("choices", [])
+                if not choices:
+                    return ChatResponse(
+                        reply="I was unable to process your request.",
+                        draft_expense=None,
+                        tool_calls=[],
+                    )
+
+                assistant_msg = choices[0].get("message", {})
+                tool_calls = assistant_msg.get("tool_calls") or []
+
+                # If no tool calls requested, return assistant text
+                if not tool_calls:
+                    reply_text = assistant_msg.get("content") or "How can I assist you with your household expenses?"
+                    return ChatResponse(
+                        reply=reply_text,
+                        draft_expense=None,
+                        tool_calls=[],
+                    )
+
+                # Step 2: Execute requested tools securely
+                tool_messages: list[dict[str, Any]] = []
+
+                for call in tool_calls:
+                    func = call.get("function", {})
+                    call_name = func.get("name", "")
+                    call_id = call.get("id") or f"call_{call_name}"
+                    executed_tools.append(call_name)
+
+                    raw_args = func.get("arguments", {})
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except Exception:
+                            raw_args = {}
+
+                    try:
+                        tool_res, draft = execute_authorized_tool(
+                            name=call_name,
+                            raw_args=raw_args,
+                            db=db,
+                            household_id=household_id,
+                            actor_id=actor_id,
+                        )
+                        if draft:
+                            final_draft = draft
+                        content_str = json.dumps(tool_res)
+                    except Exception as err:  # noqa: BLE001
+                        logger.warning(f"Tool {call_name} execution error: {err}")
+                        content_str = json.dumps({"error": str(err)})
+
+                    tool_messages.append({
+                        "role": "tool",
+                        "name": call_name,
+                        "tool_call_id": call_id,
+                        "content": content_str,
+                    })
+
+                # Step 3: Return tool results back to Mistral for natural language explanation
+                follow_up_messages = list(messages)
+                follow_up_messages.append({
+                    "role": "assistant",
+                    "content": assistant_msg.get("content") or "",
+                    "tool_calls": tool_calls,
+                })
+                follow_up_messages.extend(tool_messages)
+
+                second_payload = {
+                    "model": self.model,
+                    "messages": follow_up_messages,
+                    "tools": tools_payload,
+                }
+
+                second_resp = client.post(self.base_url, headers=headers, json=second_payload)
+                second_resp.raise_for_status()
+                second_data = second_resp.json()
+
+                second_choices = second_data.get("choices", [])
+                reply_text = ""
+                if second_choices:
+                    reply_text = second_choices[0].get("message", {}).get("content") or ""
+
                 return ChatResponse(
-                    reply=reply_text or "How can I assist you with your household expenses?",
-                    draft_expense=None,
-                    tool_calls=[],
+                    reply=reply_text or "I have processed your request.",
+                    draft_expense=final_draft,
+                    tool_calls=executed_tools,
                 )
 
-            # Step 2: Execute requested tools securely
-            tool_results_content: list[dict[str, Any]] = []
-
-            for call in tool_calls:
-                executed_tools.append(call.name)
-                try:
-                    tool_res, draft = execute_authorized_tool(
-                        name=call.name,
-                        raw_args=call.input,
-                        db=db,
-                        household_id=household_id,
-                        actor_id=actor_id,
-                    )
-                    if draft:
-                        final_draft = draft
-                    content_str = json.dumps(tool_res)
-                except Exception as err:  # noqa: BLE001
-                    logger.warning(f"Tool {call.name} execution error: {err}")
-                    content_str = json.dumps({"error": str(err)})
-
-                tool_results_content.append({
-                    "type": "tool_result",
-                    "tool_use_id": call.id,
-                    "content": content_str,
-                })
-
-            # Step 3: Return tool results back to Claude for natural language explanation
-            follow_up_messages = list(messages)
-            follow_up_messages.append({"role": "assistant", "content": response.content})
-            follow_up_messages.append({"role": "user", "content": tool_results_content})
-
-            second_response = client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=follow_up_messages,
-                tools=APPROVED_TOOLS,
-            )
-
-            reply_text = "".join(c.text for c in second_response.content if c.type == "text")
-
-            return ChatResponse(
-                reply=reply_text or "I have processed your request.",
-                draft_expense=final_draft,
-                tool_calls=executed_tools,
-            )
-
-        except anthropic.APITimeoutError as err:
-            logger.error(f"Claude API timeout: {err}")
+        except httpx.TimeoutException as err:
+            logger.error(f"Mistral API timeout: {err}")
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="AI service timed out while processing your request. Please try again.",
             )
-        except anthropic.APIConnectionError as err:
-            logger.error(f"Claude connection error: {err}")
+        except (httpx.ConnectError, httpx.NetworkError) as err:
+            logger.error(f"Mistral connection error: {err}")
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Unable to reach AI service provider. Please check network connection.",
             )
-        except anthropic.APIStatusError as err:
-            logger.error(f"Claude API status error {err.status_code}: {err.message}")
+        except httpx.HTTPStatusError as err:
+            logger.error(f"Mistral API status error {err.response.status_code}: {err.response.text}")
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"AI service provider returned an error: {err.message}",
+                detail=f"AI service provider returned an error: {err.response.text}",
             )
         except HTTPException:
             raise
